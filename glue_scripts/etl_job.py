@@ -1,4 +1,13 @@
+#!/usr/bin/env python3
+"""
+AWS Glue ETL Job: S3 CSV to Aurora PostgreSQL
+Lê arquivo CSV do S3 e grava em tabela Aurora PostgreSQL
+Usa conexões Glue e credenciais do Secrets Manager
+"""
+
 import sys
+import boto3
+import json
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -7,258 +16,526 @@ from awsglue.job import Job
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
-import re
+from pyspark.sql.window import Window
 
-# Inicialização
-args = getResolvedOptions(sys.argv, ['JOB_NAME', 'S3_BUCKET', 'DATABASE_NAME', 'CONNECTION_NAME'])
+# =============================================================================
+# CONFIGURAÇÃO INICIAL
+# =============================================================================
+
+# Obter argumentos do job
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'S3_INPUT_PATH',
+    'TARGET_TABLE',
+    'CONNECTION_NAME',
+    'SECRET_NAME',
+    'DATABASE_NAME',
+    'SCHEMA_NAME'  # Novo parâmetro para schema específico
+])
+
+# Inicializar contextos Spark/Glue
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# Configurações
-s3_bucket = args['S3_BUCKET']
-database_name = args['DATABASE_NAME']
-connection_name = args['CONNECTION_NAME']
+# Configurar logging
+logger = glueContext.get_logger()
+logger.info(f"=== INICIANDO JOB ETL: {args['JOB_NAME']} ===")
 
-def clean_column_names(df):
-    """Limpa nomes de colunas removendo caracteres especiais"""
-    for col_name in df.columns:
-        clean_name = re.sub(r'[^\w]', '_', col_name.lower())
-        clean_name = re.sub(r'_+', '_', clean_name).strip('_')
-        df = df.withColumnRenamed(col_name, clean_name)
-    return df
+# =============================================================================
+# FUNÇÕES AUXILIARES
+# =============================================================================
 
-def process_reclamacoes_data():
-    """Processa dados de reclamações"""
-    print("Processando dados de reclamações...")
-    
-    # Lista de arquivos de reclamações
-    reclamacoes_files = [
-        "2021_tri_01.csv", "2021_tri_02.csv", "2021_tri_03.csv", "2021_tri_04.csv",
-        "2022_tri_01.csv", "2022_tri_03.csv", "2022_tri_04.csv"
-    ]
-    
-    all_reclamacoes = []
-    
-    for file_name in reclamacoes_files:
+def get_secret_value(secret_name: str, region: str = 'us-east-1') -> dict:
+    """
+    Recupera credenciais do AWS Secrets Manager
+    """
+    try:
+        logger.info(f"Recuperando credenciais do secret: {secret_name}")
+        
+        # Cliente Secrets Manager
+        secrets_client = boto3.client('secretsmanager', region_name=region)
+        
+        # Obter secret
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret_string = response['SecretString']
+        
+        # Parse JSON
+        credentials = json.loads(secret_string)
+        logger.info("✅ Credenciais recuperadas com sucesso")
+        
+        return credentials
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao recuperar credenciais: {str(e)}")
+        raise e
+
+def detect_csv_separator(s3_path: str) -> str:
+    """
+    Detecta o separador do CSV baseado na extensão e conteúdo
+    """
+    try:
+        if s3_path.lower().endswith('.tsv'):
+            return '\t'
+        elif '|' in s3_path or 'glassdoor' in s3_path.lower():
+            return '|'
+        else:
+            return ','
+    except:
+        return ','
+
+def read_csv_from_s3(s3_path: str) -> DataFrame:
+    """
+    Lê arquivo CSV do S3 usando Spark
+    """
+    try:
+        logger.info(f"Lendo arquivo CSV do S3: {s3_path}")
+        
+        # Detectar separador automaticamente
+        separator = detect_csv_separator(s3_path)
+        logger.info(f"📋 Separador detectado: '{separator}'")
+        
+        # Ler CSV com inferência de schema
+        df = spark.read \
+            .option("header", "true") \
+            .option("inferSchema", "true") \
+            .option("encoding", "UTF-8") \
+            .option("sep", separator) \
+            .option("quote", '"') \
+            .option("escape", '"') \
+            .option("multiline", "true") \
+            .csv(s3_path)
+        
+        # Log informações do DataFrame
+        row_count = df.count()
+        col_count = len(df.columns)
+        
+        logger.info(f"✅ CSV lido com sucesso:")
+        logger.info(f"   - Linhas: {row_count:,}")
+        logger.info(f"   - Colunas: {col_count}")
+        logger.info(f"   - Schema: {df.schema}")
+        
+        # Mostrar primeiras linhas (para debug)
+        logger.info("📋 Primeiras 5 linhas:")
+        df.show(5, truncate=False)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao ler CSV do S3: {str(e)}")
+        raise e
+
+def transform_data(df: DataFrame) -> DataFrame:
+    """
+    Aplica transformações nos dados (customize conforme necessário)
+    """
+    try:
+        logger.info("🔄 Aplicando transformações nos dados...")
+        
+        # Verificar se coluna 'id' existe (com variações)
+        column_names_lower = [col.lower() for col in df.columns]
+        id_variations = ['id', 'id_', '_id', 'pk', 'primary_key', 'key']
+        
+        existing_id_col = None
+        for variation in id_variations:
+            if variation in column_names_lower:
+                # Encontrar o nome original da coluna
+                original_idx = column_names_lower.index(variation)
+                existing_id_col = df.columns[original_idx]
+                break
+        
+        if existing_id_col:
+            logger.info(f"✅ Coluna ID encontrada: '{existing_id_col}'")
+            # Renomear para 'id' se necessário
+            if existing_id_col.lower() != 'id':
+                df = df.withColumnRenamed(existing_id_col, 'id')
+                logger.info(f"🔄 Coluna '{existing_id_col}' renomeada para 'id'")
+        else:
+            logger.info("⚠️ Coluna 'id' não encontrada. Criando ID incremental...")
+            # Adicionar coluna ID incremental usando row_number()
+            from pyspark.sql.window import Window
+            
+            # Criar window spec para row_number
+            window_spec = Window.orderBy(monotonically_increasing_id())
+            
+            # Adicionar coluna ID incremental
+            df = df.withColumn("id", row_number().over(window_spec))
+            logger.info("✅ Coluna 'id' criada com valores incrementais")
+        
+        # Aplicar outras transformações
+        df_transformed = df \
+            .withColumn("created_at", current_timestamp()) \
+            .withColumn("updated_at", current_timestamp())
+        
+        # Validar se ID não é nulo (agora que garantimos que existe)
+        initial_count = df_transformed.count()
+        df_transformed = df_transformed.filter(col("id").isNotNull())
+        final_count = df_transformed.count()
+        
+        if initial_count != final_count:
+            logger.warning(f"⚠️ Removidas {initial_count - final_count} linhas com ID nulo")
+        
+        # Limpar nomes de colunas (remover espaços, caracteres especiais)
+        for old_col in df_transformed.columns:
+            new_col = old_col.strip().lower().replace(" ", "").replace("-", "").replace(".", "_")
+            # Remover caracteres especiais adicionais
+            import re
+            new_col = re.sub(r'[^\w]', '_', new_col)
+            # Remover underscores múltiplos
+            new_col = re.sub(r'+', '', new_col).strip('_')
+            
+            if old_col != new_col:
+                df_transformed = df_transformed.withColumnRenamed(old_col, new_col)
+                logger.info(f"🔄 Coluna renomeada: '{old_col}' → '{new_col}'")
+        
+        # Log informações sobre a coluna ID
         try:
-            # Lê arquivo CSV do S3
-            df = spark.read.option("header", "true") \
-                          .option("delimiter", ";") \
-                          .option("encoding", "ISO-8859-1") \
-                          .csv(f"s3://{s3_bucket}/raw-data/reclamacoes/{file_name}")
+            id_stats = df_transformed.agg(
+                min("id").alias("min_id"),
+                max("id").alias("max_id"),
+                count("id").alias("count_id")
+            ).collect()[0]
             
-            # Adiciona coluna com nome do arquivo
-            df = df.withColumn("arquivo_origem", lit(file_name))
-            
-            # Limpa nomes das colunas
-            df = clean_column_names(df)
-            
-            # Converte tipos de dados
-            df = df.withColumn("ano", col("ano").cast(IntegerType())) \
-                   .withColumn("indice", regexp_replace(col("indice"), ",", ".").cast(DecimalType(10,2))) \
-                   .withColumn("quantidade_de_reclamacoes_reguladas_procedentes", 
-                              col("quantidade_de_reclamacoes_reguladas_procedentes").cast(IntegerType())) \
-                   .withColumn("quantidade_de_reclamacoes_reguladas_outras", 
-                              col("quantidade_de_reclamacoes_reguladas_outras").cast(IntegerType())) \
-                   .withColumn("quantidade_de_reclamacoes_nao_reguladas", 
-                              col("quantidade_de_reclamacoes_nao_reguladas").cast(IntegerType())) \
-                   .withColumn("quantidade_total_de_reclamacoes", 
-                              col("quantidade_total_de_reclamacoes").cast(IntegerType())) \
-                   .withColumn("quantidade_total_de_clientes_ccs_e_scr", 
-                              col("quantidade_total_de_clientes_ccs_e_scr").cast(LongType())) \
-                   .withColumn("quantidade_de_clientes_ccs", 
-                              col("quantidade_de_clientes_ccs").cast(LongType())) \
-                   .withColumn("quantidade_de_clientes_scr", 
-                              col("quantidade_de_clientes_scr").cast(LongType()))
-            
-            all_reclamacoes.append(df)
-            print(f"Processado: {file_name} - {df.count()} registros")
-            
+            logger.info(f"📊 Estatísticas da coluna ID:")
+            logger.info(f"   - ID mínimo: {id_stats['min_id']}")
+            logger.info(f"   - ID máximo: {id_stats['max_id']}")
+            logger.info(f"   - Total de registros: {id_stats['count_id']:,}")
         except Exception as e:
-            print(f"Erro ao processar {file_name}: {str(e)}")
-    
-    # Une todos os DataFrames
-    if all_reclamacoes:
-        reclamacoes_df = all_reclamacoes[0]
-        for df in all_reclamacoes[1:]:
-            reclamacoes_df = reclamacoes_df.union(df)
+            logger.warning(f"⚠️ Não foi possível calcular estatísticas do ID: {str(e)}")
         
-        # Remove registros com dados vazios importantes
-        reclamacoes_df = reclamacoes_df.filter(col("instituicao_financeira").isNotNull() & 
-                                              (col("instituicao_financeira") != ""))
+        logger.info(f"✅ Transformações aplicadas. Linhas finais: {df_transformed.count():,}")
         
-        return reclamacoes_df
-    
-    return None
-
-def process_bancos_data():
-    """Processa dados de bancos"""
-    print("Processando dados de bancos...")
-    
-    try:
-        # Lê arquivo TSV do S3
-        df = spark.read.option("header", "true") \
-                      .option("delimiter", "\t") \
-                      .option("encoding", "UTF-8") \
-                      .csv(f"s3://{s3_bucket}/raw-data/bancos/EnquadramentoInicia_v2.tsv")
+        # Log schema final
+        logger.info("📋 Schema final:")
+        for field in df_transformed.schema.fields:
+            logger.info(f"   - {field.name}: {field.dataType}")
         
-        # Limpa nomes das colunas
-        df = clean_column_names(df)
-        
-        # Remove registros vazios
-        df = df.filter(col("nome").isNotNull() & (col("nome") != ""))
-        
-        print(f"Bancos processados: {df.count()} registros")
-        return df
+        return df_transformed
         
     except Exception as e:
-        print(f"Erro ao processar dados de bancos: {str(e)}")
-        return None
+        logger.error(f"❌ Erro nas transformações: {str(e)}")
+        raise e
 
-def process_empregados_data():
-    """Processa dados de empregados"""
-    print("Processando dados de empregados...")
-    
+def write_to_aurora(df: DataFrame, connection_name: str, database_name: str, schema_name: str, table_name: str, credentials: dict, table_exists: bool = False):
+    """
+    Escreve DataFrame no Aurora PostgreSQL usando conexão Glue
+    """
     try:
-        # Lê arquivo CSV do S3
-        df = spark.read.option("header", "true") \
-                      .option("delimiter", "|") \
-                      .option("encoding", "UTF-8") \
-                      .csv(f"s3://{s3_bucket}/raw-data/empregados/glassdoor_consolidado_join_match_v2.csv")
+        logger.info(f"📝 Escrevendo dados na tabela Aurora: {database_name}.{schema_name}.{table_name}")
         
-        # Limpa nomes das colunas
-        df = clean_column_names(df)
+        # Construir JDBC URL
+        jdbc_url = f"jdbc:postgresql://{credentials['host']}:{credentials['port']}/{database_name}"
         
-        # Converte tipos de dados
-        numeric_columns = ["reviews_count", "culture_count", "salaries_count", "benefits_count",
-                          "employer_founded", "geral", "cultura_e_valores", "diversidade_e_inclusao",
-                          "qualidade_de_vida", "alta_lideranca", "remuneracao_e_beneficios",
-                          "oportunidades_de_carreira", "recomendam_para_outras_pessoas",
-                          "perspectiva_positiva_da_empresa", "match_percent"]
+        # Determinar modo de escrita
+        write_mode = "append" if table_exists else "overwrite"
+        logger.info(f"📋 Modo de escrita: {write_mode}")
         
-        for col_name in numeric_columns:
-            if col_name in df.columns:
-                df = df.withColumn(col_name, regexp_replace(col(col_name), ",", "."))
-                if col_name in ["reviews_count", "culture_count", "salaries_count", "benefits_count", "match_percent"]:
-                    df = df.withColumn(col_name, col(col_name).cast(IntegerType()))
+        # Nome completo da tabela com schema
+        full_table_name = f"{schema_name}.{table_name}"
+        
+        # Configurações de escrita
+        write_options = {
+            "url": jdbc_url,
+            "dbtable": full_table_name,
+            "user": credentials['username'],
+            "password": credentials['password'],
+            "driver": "org.postgresql.Driver",
+            # Configurações de performance
+            "batchsize": "1000",
+            "isolationLevel": "READ_UNCOMMITTED"
+        }
+        
+        # Escrever dados
+        df.write \
+            .format("jdbc") \
+            .options(**write_options) \
+            .mode(write_mode) \
+            .save()
+        
+        logger.info(f"✅ Dados escritos com sucesso na tabela {full_table_name}")
+        
+        # Log estatísticas finais
+        final_count = df.count()
+        logger.info(f"📊 Total de registros inseridos: {final_count:,}")
+        
+        # Verificar dados na tabela após inserção
+        verify_insertion(credentials, database_name, schema_name, table_name)
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao escrever no Aurora: {str(e)}")
+        raise e
+
+def verify_insertion(credentials: dict, database_name: str, schema_name: str, table_name: str):
+    """
+    Verifica se os dados foram inseridos corretamente
+    """
+    try:
+        logger.info(f"🔍 Verificando inserção na tabela {schema_name}.{table_name}...")
+        
+        import psycopg2
+        
+        # Conectar ao PostgreSQL
+        conn = psycopg2.connect(
+            host=credentials['host'],
+            port=credentials['port'],
+            database=database_name,
+            user=credentials['username'],
+            password=credentials['password']
+        )
+        
+        cursor = conn.cursor()
+        
+        # Contar registros na tabela
+        cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{table_name};")
+        total_count = cursor.fetchone()[0]
+        
+        # Verificar primeiros registros
+        cursor.execute(f"SELECT * FROM {schema_name}.{table_name} LIMIT 5;")
+        sample_records = cursor.fetchall()
+        
+        # Obter nomes das colunas
+        cursor.execute(f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = '{schema_name}' 
+            AND table_name = '{table_name}' 
+            ORDER BY ordinal_position;
+        """)
+        column_names = [row[0] for row in cursor.fetchall()]
+        
+        logger.info(f"✅ Verificação concluída:")
+        logger.info(f"   - Total de registros na tabela: {total_count:,}")
+        logger.info(f"   - Colunas na tabela: {len(column_names)}")
+        logger.info(f"   - Nomes das colunas: {', '.join(column_names)}")
+        
+        if sample_records:
+            logger.info("📋 Primeiros 5 registros inseridos:")
+            for i, record in enumerate(sample_records, 1):
+                logger.info(f"   Registro {i}: {record[:3]}...")  # Mostrar apenas primeiros 3 campos
+        
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Erro ao verificar inserção: {str(e)}")
+
+def create_schema_if_not_exists(credentials: dict, database_name: str, schema_name: str):
+    """
+    Cria schema no Aurora se não existir
+    """
+    try:
+        logger.info(f"🔍 Verificando se schema {schema_name} existe...")
+        
+        import psycopg2
+        
+        # Conectar ao PostgreSQL
+        conn = psycopg2.connect(
+            host=credentials['host'],
+            port=credentials['port'],
+            database=database_name,
+            user=credentials['username'],
+            password=credentials['password']
+        )
+        
+        cursor = conn.cursor()
+        
+        # Verificar se schema existe
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.schemata 
+                WHERE schema_name = %s
+            );
+        """, (schema_name,))
+        
+        schema_exists = cursor.fetchone()[0]
+        
+        if not schema_exists:
+            logger.info(f"📋 Criando schema {schema_name}...")
+            
+            # Criar schema
+            create_schema_sql = f"CREATE SCHEMA IF NOT EXISTS {schema_name};"
+            cursor.execute(create_schema_sql)
+            conn.commit()
+            
+            logger.info(f"✅ Schema {schema_name} criado com sucesso")
+        else:
+            logger.info(f"✅ Schema {schema_name} já existe")
+        
+        cursor.close()
+        conn.close()
+        
+        return schema_exists
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao verificar/criar schema: {str(e)}")
+        # Não falhar o job se não conseguir criar o schema
+        logger.warning("⚠️ Continuando sem criar schema. Certifique-se que ele existe.")
+        return False
+
+def create_table_if_not_exists(credentials: dict, database_name: str, schema_name: str, table_name: str, df: DataFrame):
+    """
+    Cria tabela no Aurora se não existir (baseado no schema do DataFrame)
+    """
+    try:
+        logger.info(f"🔍 Verificando se tabela {schema_name}.{table_name} existe...")
+        
+        import psycopg2
+        
+        # Conectar ao PostgreSQL
+        conn = psycopg2.connect(
+            host=credentials['host'],
+            port=credentials['port'],
+            database=database_name,
+            user=credentials['username'],
+            password=credentials['password']
+        )
+        
+        cursor = conn.cursor()
+        
+        # Verificar se tabela existe no schema específico
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = %s 
+                AND table_name = %s
+            );
+        """, (schema_name, table_name))
+        
+        table_exists = cursor.fetchone()[0]
+        
+        if not table_exists:
+            logger.info(f"📋 Criando tabela {schema_name}.{table_name}...")
+            
+            # Gerar DDL baseado no schema do DataFrame
+            columns_ddl = []
+            
+            # Garantir que ID seja a primeira coluna e seja PRIMARY KEY
+            id_added = False
+            for field in df.schema.fields:
+                col_name = field.name.lower()
+                col_type = field.dataType
+                
+                # Mapear tipos Spark para PostgreSQL
+                if isinstance(col_type, StringType):
+                    pg_type = "TEXT"
+                elif isinstance(col_type, IntegerType):
+                    pg_type = "INTEGER"
+                elif isinstance(col_type, LongType):
+                    pg_type = "BIGINT"
+                elif isinstance(col_type, DoubleType):
+                    pg_type = "DOUBLE PRECISION"
+                elif isinstance(col_type, BooleanType):
+                    pg_type = "BOOLEAN"
+                elif isinstance(col_type, TimestampType):
+                    pg_type = "TIMESTAMP"
+                elif isinstance(col_type, DateType):
+                    pg_type = "DATE"
                 else:
-                    df = df.withColumn(col_name, col(col_name).cast(DecimalType(10,2)))
+                    pg_type = "TEXT"  # Default
+                
+                # Se for coluna ID, adicionar como PRIMARY KEY
+                if col_name == 'id':
+                    columns_ddl.insert(0, f"{col_name} {pg_type} PRIMARY KEY")
+                    id_added = True
+                else:
+                    columns_ddl.append(f"{col_name} {pg_type}")
+            
+            # Se não encontrou coluna ID, adicionar uma
+            if not id_added:
+                columns_ddl.insert(0, "id BIGINT PRIMARY KEY")
+                logger.info("⚠️ Adicionando coluna ID como PRIMARY KEY na tabela")
+            
+            # Criar tabela no schema específico
+            create_table_sql = f"""
+                CREATE TABLE {schema_name}.{table_name} (
+                    {', '.join(columns_ddl)}
+                );
+            """
+            
+            logger.info(f"📝 DDL da tabela: {create_table_sql}")
+            cursor.execute(create_table_sql)
+            conn.commit()
+            
+            logger.info(f"✅ Tabela {schema_name}.{table_name} criada com sucesso")
+        else:
+            logger.info(f"✅ Tabela {schema_name}.{table_name} já existe")
+            
+            # Verificar se precisa limpar dados existentes
+            cursor.execute(f"SELECT COUNT(*) FROM {schema_name}.{table_name};")
+            existing_count = cursor.fetchone()[0]
+            logger.info(f"📊 Registros existentes na tabela: {existing_count:,}")
         
-        # Remove registros vazios
-        df = df.filter(col("nome").isNotNull() & (col("nome") != ""))
+        cursor.close()
+        conn.close()
         
-        print(f"Empregados processados: {df.count()} registros")
-        return df
+        return table_exists
         
     except Exception as e:
-        print(f"Erro ao processar dados de empregados: {str(e)}")
-        return None
+        logger.error(f"❌ Erro ao verificar/criar tabela: {str(e)}")
+        # Não falhar o job se não conseguir criar a tabela
+        logger.warning("⚠️ Continuando sem criar tabela. Certifique-se que ela existe.")
+        return False
 
-def create_consolidated_data(reclamacoes_df, bancos_df, empregados_df):
-    """Cria tabela consolidada"""
-    print("Criando dados consolidados...")
-    
+# =============================================================================
+# EXECUÇÃO PRINCIPAL
+# =============================================================================
+
+def main():
+    """
+    Função principal do ETL
+    """
     try:
-        # Agrega dados de reclamações por CNPJ e ano
-        reclamacoes_agg = reclamacoes_df.groupBy("cnpj_if", "ano") \
-            .agg(
-                sum("quantidade_total_de_reclamacoes").alias("total_reclamacoes"),
-                sum("quantidade_total_de_clientes_ccs_e_scr").alias("total_clientes"),
-                avg("indice").alias("indice_reclamacoes"),
-                first("instituicao_financeira").alias("nome_instituicao")
-            ) \
-            .filter(col("cnpj_if").isNotNull() & (col("cnpj_if") != ""))
+        logger.info("🚀 Iniciando processo ETL S3 → Aurora PostgreSQL")
         
-        # Join com dados de bancos para obter segmento
-        consolidated = reclamacoes_agg.join(
-            bancos_df.select("cnpj", "segmento"),
-            reclamacoes_agg.cnpj_if == bancos_df.cnpj,
-            "left"
-        )
+        # 1. Recuperar credenciais do Secrets Manager
+        logger.info("1️⃣ Recuperando credenciais...")
+        credentials = get_secret_value(args['SECRET_NAME'])
         
-        # Join com dados de empregados para obter avaliações
-        consolidated = consolidated.join(
-            empregados_df.select("nome", "geral", "cultura_e_valores", 
-                                "remuneracao_e_beneficios", "recomendam_para_outras_pessoas"),
-            upper(trim(consolidated.nome_instituicao)).contains(upper(trim(empregados_df.nome))),
-            "left"
-        )
+        # 2. Ler dados do S3
+        logger.info("2️⃣ Lendo dados do S3...")
+        df_raw = read_csv_from_s3(args['S3_INPUT_PATH'])
         
-        # Seleciona e renomeia colunas finais
-        consolidated = consolidated.select(
-            col("cnpj_if").alias("cnpj"),
-            col("nome_instituicao"),
-            col("segmento"),
-            col("ano"),
-            col("total_reclamacoes"),
-            col("total_clientes"),
-            col("indice_reclamacoes"),
-            col("geral").alias("avaliacao_geral"),
-            col("cultura_e_valores").alias("cultura_valores"),
-            col("remuneracao_e_beneficios"),
-            col("recomendam_para_outras_pessoas").alias("recomendam_empresa")
-        )
+        # 3. Aplicar transformações
+        logger.info("3️⃣ Aplicando transformações...")
+        df_transformed = transform_data(df_raw)
         
-        print(f"Dados consolidados: {consolidated.count()} registros")
-        return consolidated
+        # 4. Criar schema se não existir
+        logger.info("4️⃣ Verificando/criando schema...")
+        create_schema_if_not_exists(credentials, args['DATABASE_NAME'], args['SCHEMA_NAME'])
+        
+        # 5. Criar tabela se não existir
+        logger.info("5️⃣ Verificando/criando tabela...")
+        table_exists = create_table_if_not_exists(credentials, args['DATABASE_NAME'], args['SCHEMA_NAME'], args['TARGET_TABLE'], df_transformed)
+        
+        # 6. Escrever dados no Aurora
+        logger.info("6️⃣ Escrevendo dados no Aurora...")
+        write_to_aurora(df_transformed, args['CONNECTION_NAME'], args['DATABASE_NAME'], args['SCHEMA_NAME'], args['TARGET_TABLE'], credentials, table_exists)
+        
+        logger.info("🎉 ETL concluído com sucesso!")
+        
+        # Estatísticas finais
+        logger.info("📊 ESTATÍSTICAS FINAIS:")
+        logger.info(f"   - Arquivo S3: {args['S3_INPUT_PATH']}")
+        logger.info(f"   - Schema destino: {args['SCHEMA_NAME']}")
+        logger.info(f"   - Tabela destino: {args['DATABASE_NAME']}.{args['SCHEMA_NAME']}.{args['TARGET_TABLE']}")
+        logger.info(f"   - Registros processados: {df_transformed.count():,}")
         
     except Exception as e:
-        print(f"Erro ao criar dados consolidados: {str(e)}")
-        return None
+        logger.error(f"💥 ERRO CRÍTICO no ETL: {str(e)}")
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise e
 
-def write_to_aurora(df, table_name):
-    """Escreve DataFrame no Aurora Serverless"""
+# =============================================================================
+# EXECUÇÃO
+# =============================================================================
+
+if _name_ == "_main_":
     try:
-        # Converte para DynamicFrame
-        dynamic_frame = DynamicFrame.fromDF(df, glueContext, table_name)
-        
-        # Escreve no Aurora Serverless via conexão
-        glueContext.write_dynamic_frame.from_jdbc_conf(
-            frame=dynamic_frame,
-            catalog_connection=connection_name,
-            connection_options={
-                "dbtable": table_name,
-                "database": database_name
-            },
-            transformation_ctx=f"write_{table_name}"
-        )
-        
-        print(f"Dados escritos na tabela {table_name} no Aurora Serverless")
-        
-    except Exception as e:
-        print(f"Erro ao escrever na tabela {table_name}: {str(e)}")
-
-# Execução principal
-try:
-    # Processa cada fonte de dados
-    reclamacoes_df = process_reclamacoes_data()
-    bancos_df = process_bancos_data()
-    empregados_df = process_empregados_data()
-    
-    # Escreve dados nas tabelas individuais
-    if reclamacoes_df:
-        write_to_aurora(reclamacoes_df, "reclamacoes")
-    
-    if bancos_df:
-        write_to_aurora(bancos_df, "bancos_enquadramento")
-    
-    if empregados_df:
-        write_to_aurora(empregados_df, "empregados_glassdoor")
-    
-    # Cria e escreve dados consolidados
-    if reclamacoes_df and bancos_df and empregados_df:
-        consolidated_df = create_consolidated_data(reclamacoes_df, bancos_df, empregados_df)
-        if consolidated_df:
-            write_to_aurora(consolidated_df, "dados_consolidados")
-    
-    print("ETL concluído com sucesso no Aurora Serverless!")
-    
-except Exception as e:
-    print(f"Erro no processo ETL: {str(e)}")
-    raise e
-
-finally:
-    job.commit()
+        main()
+    finally:
+        # Finalizar job
+        job.commit()
+        logger.info("✅ Job finalizado")
